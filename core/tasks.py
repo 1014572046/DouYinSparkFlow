@@ -6,6 +6,7 @@ from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
 from playwright.sync_api import Response
 import time
+import os
 
 config = get_config()
 userData = get_userData()
@@ -73,11 +74,11 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
 def checkTargetName(targetName, targets):
     """检查targetName是否为目标
     """
-
+    
     targetSymbol = None
-
+    
     targetName = norm(targetName)
-
+    
     if targetName in userIDDict:
         matched = next((v for v in userIDDict[targetName] if v and v in targets), None)
         if matched is not None:
@@ -110,22 +111,46 @@ def scroll_and_select_user(page, username, targets):
     empty_scroll_count = 0
     MAX_EMPTY_SCROLLS = 25  # 连续25次滚动没有新好友，认为到底了
 
-    # 等待会话列表加载，避免页面未渲染完就超时退出
+    # [诊断] 先等待会话列表容器加载，失败时输出诊断信息（URL/标题/正文/截图）
+    logger.info(f"账号 {username} 等待会话列表容器加载...")
     try:
-        page.wait_for_selector(CONVERSATION_LIST_SELECTOR, timeout=30000)
-    except Exception:
-        logger.warning(f"账号 {username} 等待会话列表加载超时，尝试直接搜索")
-        # [诊断] 超时时 dump 页面 HTML，便于判断是验证码/登录页/空白页
+        page.wait_for_selector(CONVERSATION_LIST_SELECTOR, timeout=config["browserTimeout"])
+        logger.info(f"账号 {username} 会话列表容器已加载")
+    except Exception as e:
+        logger.error(f"账号 {username} 会话列表容器加载失败: {e}")
         try:
-            import os
-            os.makedirs("logs", exist_ok=True)
-            page.screenshot(path=os.path.join("logs", f"page_dump_{username}.png"))
-            html = page.content()
-            with open(os.path.join("logs", f"page_dump_{username}.html"), "w", encoding="utf-8") as f:
-                f.write(html)
-            logger.warning(f"已保存页面截图/HTML 到 logs/page_dump_{username}.png|html，HTML长度: {len(html)}")
-        except Exception as e:
-            logger.error(f"保存页面诊断信息失败: {e}")
+            logger.error(f"当前URL: {page.url}")
+            logger.error(f"页面标题: {page.title()}")
+            body_el = page.locator("body")
+            if body_el.count():
+                body_text = body_el.inner_text(timeout=8000)
+                logger.error(f"页面正文(前600字符): {body_text[:600]!r}")
+                logger.error(
+                    f"含'登录'={'登录' in body_text}, 含'验证码'={'验证码' in body_text}, "
+                    f"含'安全验证'={'安全验证' in body_text}, 含'扫码'={'扫码' in body_text}, "
+                    f"含'私信'={'私信' in body_text}"
+                )
+            shot_dir = os.path.join(os.getcwd(), "logs")
+            os.makedirs(shot_dir, exist_ok=True)
+            shot = os.path.join(shot_dir, f"screenshot_{username}.png")
+            page.screenshot(path=shot, full_page=True)
+            logger.error(f"已保存截图: {shot}")
+        except Exception as e2:
+            logger.error(f"诊断信息收集失败: {e2}")
+        raise
+
+    # [修复] 等待 user/info 接口返回以填充 userIDDict。
+    # 匹配依赖 userIDDict（会话标题/备注名 -> 昵称映射）；domcontentloaded 时接口可能尚未返回，
+    # userIDDict 为空会导致 checkTargetName 只能退化为直接昵称比较而全部匹配失败。
+    wait_start = time.time()
+    while not userIDDict and time.time() - wait_start < 60:
+        time.sleep(1)
+    if userIDDict:
+        logger.info(f"账号 {username} 好友信息接口数据就绪: {len(userIDDict)} 条")
+    else:
+        logger.warning(
+            f"账号 {username} 60秒内未收到好友信息接口数据，退化为直接昵称匹配"
+        )
 
     while True:
         # 查找所有目标元素
@@ -144,20 +169,21 @@ def scroll_and_select_user(page, username, targets):
                     continue  # 已处理过，跳过
                 found_targets.add(targetName)
 
-                logger.debug(f"账号 {username} 找到好友 {targetName}")
-
+                logger.debug(f"账号 {username} 遍历到会话 {targetName}")
+                
                 targetSymbol = checkTargetName(targetName, targets)
 
                 if targetSymbol:
+                    logger.info(f"账号 {username} 匹配到目标好友: {targetSymbol}")
                     element.click()
-
+                    
                     yield targetSymbol
 
                     # [修改] 标记已找到，如果全找到了直接退出
                     if targetSymbol in remaining_targets:
                         remaining_targets.remove(targetSymbol)
                     if len(remaining_targets) == 0:
-                        logger.debug(f"账号 {username} 所有目标好友均已找到，停止搜索")
+                        logger.info(f"账号 {username} 所有目标好友均已找到，停止搜索")
                         return
                     break
             except Exception as e:
@@ -198,7 +224,7 @@ def scroll_and_select_user(page, username, targets):
             #     time.sleep(1.5)  # 给加载留点时间
             #     # 不 break，继续去滚动以触发后续内容
 
-            # 4. 滚动容器（自动探测真正的可滚动元素）
+            # 4. 滚动容器（自动探测真正的可滚动元素，兼容嵌套结构）
             try:
                 scroll_info = page.evaluate("""() => {
                     const root = document.querySelector('.conversationConversationListwrapper');
@@ -258,20 +284,23 @@ def do_user_task(browser, username, cookies, targets):
     context.add_cookies(cookies)
 
     # 打开抖音网页聊天页面
+    # 使用 domcontentloaded 而不是默认 load：douyin 页面 load 事件可能一直不触发
+    # （长连接/埋点资源），默认模式会每次都等到 120s 超时边缘才返回
     retry_operation(
         "打开抖音网页聊天页面",
         page.goto,
         retries=config["taskRetryTimes"],
         delay=5,
         url="https://www.douyin.com/chat",
+        wait_until="domcontentloaded",
     )
 
     time.sleep(5)  # 等待5秒让过可能存在的弹窗
 
-    logger.debug(f"账号 {username} 开始发送消息")
+    logger.info(f"账号 {username} 开始发送消息")
     # 滚动并选择用户
     for username in scroll_and_select_user(page, username, targets):
-        logger.debug(f"账号 {username} 已选中好友 {username} 发送消息")
+        logger.info(f"账号 {username} 已选中好友 {username} 发送消息")
         # 等待聊天输入框元素加载完成，使用更稳定的属性选择器
         chat_input_selector = CHAT_EDITOR_SELECTOR
         page.wait_for_selector(chat_input_selector, timeout=config["browserTimeout"])
@@ -286,7 +315,7 @@ def do_user_task(browser, username, cookies, targets):
                 chat_input.press("Shift+Enter")  # 模拟 Shift+Enter 插入换行
 
         logger.debug(f"账号 {username} 准备发送消息给好友 {username}：\n\t{message}")
-        logger.debug(f"账号 {username} 给好友 {username} 发送消息完成")
+        logger.info(f"账号 {username} 给好友 {username} 发送消息完成")
         # 模拟按下回车键发送消息
         chat_input.press("Enter")
         time.sleep(2)  # 发送完等待一会儿
