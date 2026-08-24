@@ -33,7 +33,9 @@ def handle_response(response: Response):
             json_data = response.json()
             # print("\n📦 响应 JSON 数据：")
             # print(json.dumps(json_data, indent=4, ensure_ascii=False))
-            for item in json_data.get("data", []):
+            if not isinstance(json_data, dict):
+                return
+            for item in (json_data.get("data") or []):
                 short_id = item.get("short_id")
                 unique_id = item.get("unique_id")
                 sec_uid = item.get("sec_uid", "")
@@ -71,11 +73,11 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
 def checkTargetName(targetName, targets):
     """检查targetName是否为目标
     """
-    
+
     targetSymbol = None
-    
+
     targetName = norm(targetName)
-    
+
     if targetName in userIDDict:
         matched = next((v for v in userIDDict[targetName] if v and v in targets), None)
         if matched is not None:
@@ -106,7 +108,13 @@ def scroll_and_select_user(page, username, targets):
 
     # [修复] 新增：连续空滚动计数器（滚动后没有发现新好友的次数）
     empty_scroll_count = 0
-    MAX_EMPTY_SCROLLS = 10  # 连续10次滚动没有新好友，认为到底了
+    MAX_EMPTY_SCROLLS = 25  # 连续25次滚动没有新好友，认为到底了
+
+    # 等待会话列表加载，避免页面未渲染完就超时退出
+    try:
+        page.wait_for_selector(CONVERSATION_LIST_SELECTOR, timeout=30000)
+    except Exception:
+        logger.warning(f"账号 {username} 等待会话列表加载超时，尝试直接搜索")
 
     while True:
         # 查找所有目标元素
@@ -126,12 +134,12 @@ def scroll_and_select_user(page, username, targets):
                 found_targets.add(targetName)
 
                 logger.debug(f"账号 {username} 找到好友 {targetName}")
-                
+
                 targetSymbol = checkTargetName(targetName, targets)
 
                 if targetSymbol:
                     element.click()
-                    
+
                     yield targetSymbol
 
                     # [修改] 标记已找到，如果全找到了直接退出
@@ -179,38 +187,43 @@ def scroll_and_select_user(page, username, targets):
             #     time.sleep(1.5)  # 给加载留点时间
             #     # 不 break，继续去滚动以触发后续内容
 
-            # 4. 滚动容器
-            scrollable_element = page.locator(
-                scrollable_friends_selector
-            ).element_handle()
+            # 4. 滚动容器（自动探测真正的可滚动元素）
+            try:
+                scroll_info = page.evaluate("""() => {
+                    const root = document.querySelector('.conversationConversationListwrapper');
+                    if (!root) return null;
+                    let el = root;
+                    while (el && el !== document.documentElement && el.scrollHeight <= el.clientHeight + 1) {
+                        el = el.parentElement;
+                    }
+                    if (!el || el.scrollHeight <= el.clientHeight + 1) {
+                        const stack = [...root.children];
+                        while (stack.length) {
+                            const c = stack.pop();
+                            if (c.scrollHeight > c.clientHeight + 1) { el = c; break; }
+                            for (const ch of c.children) stack.push(ch);
+                        }
+                    }
+                    if (!el) return null;
+                    const before = el.scrollTop;
+                    el.scrollTop += 800;
+                    return { cls: (el.className||'').toString().slice(0,80), before, after: el.scrollTop };
+                }""")
+            except Exception as e:
+                logger.error(f"账号 {username} 滚动探测出错: {e}")
+                scroll_info = None
 
-            if scrollable_element:
-                # [修复] 记录滚动前的 scrollTop，用于检测是否真的滚动了
-                scroll_top_before = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-
-                page.evaluate(
-                    "(element) => element.scrollTop += 800", scrollable_element
-                )
-
-                # [修复] 检测滚动后的 scrollTop
-                time.sleep(0.3)
-                scroll_top_after = page.evaluate(
-                    "(element) => element.scrollTop", scrollable_element
-                )
-
-                if scroll_top_before == scroll_top_after:
-                    # scrollTop 没有变化，说明已经到底了
-                    empty_scroll_count += 2  # 加速判定到底
+            if scroll_info:
+                if scroll_info.get('before') == scroll_info.get('after'):
+                    empty_scroll_count += 1
                     logger.debug(
-                        f"账号 {username} scrollTop 未变化 ({scroll_top_before})，可能已到底 (空滚动计数: {empty_scroll_count}/{MAX_EMPTY_SCROLLS})"
+                        f"账号 {username} scrollTop 未变化 ({scroll_info.get('before')})，可能已到底 (空滚动计数: {empty_scroll_count}/{MAX_EMPTY_SCROLLS}) (滚动元素: {scroll_info.get('cls')})"
                     )
                 else:
+                    empty_scroll_count = 0
                     logger.debug(
-                        f"账号 {username} 滚动好友列表以加载更多好友 (scrollTop: {scroll_top_before} -> {scroll_top_after})"
+                        f"账号 {username} 滚动好友列表以加载更多好友 (scrollTop: {scroll_info.get('before')} -> {scroll_info.get('after')}) (滚动元素: {scroll_info.get('cls')})"
                     )
-
                 time.sleep(1.5)
             else:
                 logger.error(f"账号 {username} 未找到滚动容器，退出")
