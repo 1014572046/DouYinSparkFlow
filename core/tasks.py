@@ -115,6 +115,17 @@ def scroll_and_select_user(page, username, targets):
         page.wait_for_selector(CONVERSATION_LIST_SELECTOR, timeout=30000)
     except Exception:
         logger.warning(f"账号 {username} 等待会话列表加载超时，尝试直接搜索")
+        # [诊断] 超时时 dump 页面 HTML，便于判断是验证码/登录页/空白页
+        try:
+            import os
+            os.makedirs("logs", exist_ok=True)
+            page.screenshot(path=os.path.join("logs", f"page_dump_{username}.png"))
+            html = page.content()
+            with open(os.path.join("logs", f"page_dump_{username}.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+            logger.warning(f"已保存页面截图/HTML 到 logs/page_dump_{username}.png|html，HTML长度: {len(html)}")
+        except Exception as e:
+            logger.error(f"保存页面诊断信息失败: {e}")
 
     while True:
         # 查找所有目标元素
