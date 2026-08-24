@@ -34,7 +34,9 @@ def handle_response(response: Response):
             json_data = response.json()
             # print("\n📦 响应 JSON 数据：")
             # print(json.dumps(json_data, indent=4, ensure_ascii=False))
-            for item in json_data.get("data", []):
+            if not isinstance(json_data, dict):
+                return
+            for item in (json_data.get("data") or []):
                 short_id = item.get("short_id")
                 unique_id = item.get("unique_id")
                 sec_uid = item.get("sec_uid", "")
